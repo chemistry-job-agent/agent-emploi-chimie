@@ -63,3 +63,16 @@ profil.json
 # Sauvegardes / ancien code local
 *_backup.py
 legacy/
+
+# Anciennes versions locales
+agent.py
+agent_recherche.py
+benchmark_modeles.py
+cherche_offres.py
+cv_manager.py
+database.py
+initialiser_agent.py
+source_apec.py
+
+# Scripts de test locaux
+test_*.py
