@@ -76,3 +76,6 @@ source_apec.py
 
 # Scripts de test locaux
 test_*.py
+
+# Profil CV personnel structuré
+profil_cv_structure.json
