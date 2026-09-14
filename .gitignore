@@ -1,0 +1,65 @@
+# ============================================================
+# SECRETS / IDENTIFIANTS
+# ============================================================
+
+.env
+
+credentials.json
+token.json
+gmail_credentials.json
+gmail_token.json
+gmail_processed.json
+
+# Fichier OAuth brut téléchargé depuis Google
+client_secret_*.json
+
+
+# ============================================================
+# BASES DE DONNÉES
+# ============================================================
+
+agent_emploi.db
+agent_emploi_v2.db
+
+# Fichiers temporaires SQLite éventuels
+*.db-wal
+*.db-shm
+
+
+# ============================================================
+# DONNÉES PERSONNELLES
+# ============================================================
+
+cv/
+candidatures/
+
+# Emails éventuellement exportés
+alertes_inbox/
+alertes_archive/
+
+
+# ============================================================
+# PYTHON
+# ============================================================
+
+__pycache__/
+*.pyc
+
+.venv/
+venv/
+
+
+# ============================================================
+# RÉSULTATS LOCAUX
+# ============================================================
+
+resultats_offres.csv
+resultats_offres.json
+resultats_v2.json
+
+# Profil personnel
+profil.json
+
+# Sauvegardes / ancien code local
+*_backup.py
+legacy/
