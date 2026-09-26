@@ -1,7 +1,10 @@
 import base64
 import json
+import time
+
 from pathlib import Path
 
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -9,7 +12,17 @@ from googleapiclient.discovery import build
 
 from sources.alert_inbox import (
     extraire_html,
-    extraire_texte
+    extraire_texte,
+)
+
+from sources.linkedin_alerts import (
+    extraire_offres_linkedin_html,
+    extraire_offres_linkedin_texte,
+)
+
+from sources.linkedin_enricher import (
+    enrichir_offre_linkedin,
+    linkedin_description_complete,
 )
 
 
@@ -35,9 +48,14 @@ STATE_FILE = Path(
 
 
 LABELS_EMPLOI = {
-    "AGENT-EMPLOI/LINKEDIN": "LinkedIn",
-    "AGENT-EMPLOI/APEC": "Apec",
-    "AGENT-EMPLOI/INDEED": "Indeed"
+    "AGENT-EMPLOI/LinkedIn":
+        "LinkedIn",
+
+    "AGENT-EMPLOI/APEC":
+        "Apec",
+
+    "AGENT-EMPLOI/INDEED":
+        "Indeed",
 }
 
 
@@ -45,70 +63,123 @@ LABELS_EMPLOI = {
 # CONNEXION GMAIL
 # ============================================================
 
+def creer_nouvelle_authentification():
+
+    if not CREDENTIALS_FILE.exists():
+
+        raise FileNotFoundError(
+            "credentials.json introuvable."
+        )
+
+    flow = (
+        InstalledAppFlow
+        .from_client_secrets_file(
+            str(
+                CREDENTIALS_FILE
+            ),
+            SCOPES,
+        )
+    )
+
+    credentials = (
+        flow.run_local_server(
+            port=0
+        )
+    )
+
+    TOKEN_FILE.write_text(
+        credentials.to_json(),
+        encoding="utf-8",
+    )
+
+    return credentials
+
+
 def connexion_gmail():
+
     credentials = None
 
     if TOKEN_FILE.exists():
 
-        credentials = (
-            Credentials
-            .from_authorized_user_file(
-                str(TOKEN_FILE),
-                SCOPES
+        try:
+
+            credentials = (
+                Credentials
+                .from_authorized_user_file(
+                    str(
+                        TOKEN_FILE
+                    ),
+                    SCOPES,
+                )
             )
+
+        except Exception:
+
+            credentials = None
+
+    if credentials and credentials.valid:
+
+        return build(
+            "gmail",
+            "v1",
+            credentials=credentials,
         )
 
     if (
-        not credentials
-        or not credentials.valid
+        credentials
+        and credentials.expired
+        and credentials.refresh_token
     ):
 
-        if (
-            credentials
-            and credentials.expired
-            and credentials.refresh_token
-        ):
+        try:
 
             credentials.refresh(
                 Request()
             )
 
-        else:
-
-            if not CREDENTIALS_FILE.exists():
-
-                raise FileNotFoundError(
-                    "credentials.json introuvable."
-                )
-
-            flow = (
-                InstalledAppFlow
-                .from_client_secrets_file(
-                    str(CREDENTIALS_FILE),
-                    SCOPES
-                )
+            TOKEN_FILE.write_text(
+                credentials.to_json(),
+                encoding="utf-8",
             )
+
+        except RefreshError:
+
+            print(
+                "⚠️ Jeton Gmail expiré ou révoqué."
+            )
+
+            print(
+                "🔐 Nouvelle authentification Gmail..."
+            )
+
+            try:
+
+                TOKEN_FILE.unlink(
+                    missing_ok=True
+                )
+
+            except Exception:
+                pass
 
             credentials = (
-                flow.run_local_server(
-                    port=0
-                )
+                creer_nouvelle_authentification()
             )
 
-        TOKEN_FILE.write_text(
-            credentials.to_json(),
-            encoding="utf-8"
+    else:
+
+        credentials = (
+            creer_nouvelle_authentification()
         )
 
     return build(
         "gmail",
         "v1",
-        credentials=credentials
+        credentials=credentials,
     )
 
 
 # ============================================================
-# MÉMOIRE DES MAILS DÉJÀ TRAITÉS
+# MEMOIRE DES MAILS
 # ============================================================
 
 def charger_messages_traites():
@@ -129,6 +200,7 @@ def charger_messages_traites():
         )
 
     except Exception:
+
         return set()
 
 
@@ -138,19 +210,23 @@ def sauvegarder_messages_traites(
 
     STATE_FILE.write_text(
         json.dumps(
-            sorted(messages),
+            sorted(
+                messages
+            ),
             ensure_ascii=False,
-            indent=2
+            indent=2,
         ),
-        encoding="utf-8"
+        encoding="utf-8",
     )
 
 
 # ============================================================
-# LIBELLÉS GMAIL
+# LIBELLES GMAIL
 # ============================================================
 
-def recuperer_libelles(service):
+def recuperer_libelles(
+    service
+):
 
     resultat = (
         service.users()
@@ -165,20 +241,21 @@ def recuperer_libelles(service):
 
     for libelle in resultat.get(
         "labels",
-        []
+        [],
     ):
 
         nom = libelle.get(
             "name",
-            ""
+            "",
         )
 
         identifiant = libelle.get(
             "id",
-            ""
+            "",
         )
 
         if nom:
+
             libelles[
                 nom
             ] = identifiant
@@ -186,11 +263,43 @@ def recuperer_libelles(service):
     return libelles
 
 
+def trouver_label_id(
+    libelles,
+    nom_recherche
+):
+
+    if nom_recherche in libelles:
+
+        return libelles[
+            nom_recherche
+        ]
+
+    recherche = (
+        nom_recherche
+        .casefold()
+    )
+
+    for nom_reel, identifiant in (
+        libelles.items()
+    ):
+
+        if (
+            nom_reel.casefold()
+            == recherche
+        ):
+
+            return identifiant
+
+    return None
+
+
 # ============================================================
-# DÉCODAGE DU CONTENU GMAIL
+# DECODAGE GMAIL
 # ============================================================
 
-def decoder_base64url(data):
+def decoder_base64url(
+    data
+):
 
     if not data:
         return ""
@@ -198,7 +307,8 @@ def decoder_base64url(data):
     try:
 
         contenu = (
-            base64.urlsafe_b64decode(
+            base64
+            .urlsafe_b64decode(
                 data.encode(
                     "utf-8"
                 )
@@ -207,10 +317,11 @@ def decoder_base64url(data):
 
         return contenu.decode(
             "utf-8",
-            errors="ignore"
+            errors="ignore",
         )
 
     except Exception:
+
         return ""
 
 
@@ -222,12 +333,12 @@ def parcourir_payload(
 
     mime_type = payload.get(
         "mimeType",
-        ""
+        "",
     )
 
     body = payload.get(
         "body",
-        {}
+        {},
     )
 
     data = body.get(
@@ -254,13 +365,13 @@ def parcourir_payload(
 
     for partie in payload.get(
         "parts",
-        []
+        [],
     ):
 
         parcourir_payload(
             partie,
             htmls,
-            textes
+            textes,
         )
 
 
@@ -270,7 +381,7 @@ def extraire_corps_email(
 
     payload = message.get(
         "payload",
-        {}
+        {},
     )
 
     htmls = []
@@ -279,19 +390,23 @@ def extraire_corps_email(
     parcourir_payload(
         payload,
         htmls,
-        textes
+        textes,
     )
 
     if htmls:
 
         return (
-            "\n".join(htmls),
-            True
+            "\n".join(
+                htmls
+            ),
+            True,
         )
 
     return (
-        "\n".join(textes),
-        False
+        "\n".join(
+            textes
+        ),
+        False,
     )
 
 
@@ -309,11 +424,11 @@ def extraire_headers(
         message
         .get(
             "payload",
-            {}
+            {},
         )
         .get(
             "headers",
-            []
+            [],
         )
     )
 
@@ -321,12 +436,12 @@ def extraire_headers(
 
         nom = header.get(
             "name",
-            ""
+            "",
         )
 
         valeur = header.get(
             "value",
-            ""
+            "",
         )
 
         resultat[
@@ -337,13 +452,13 @@ def extraire_headers(
 
 
 # ============================================================
-# MESSAGES D'UN LIBELLÉ
+# MESSAGES D'UN LIBELLE
 # ============================================================
 
 def lister_messages(
     service,
     label_id,
-    max_messages=100
+    max_messages=100,
 ):
 
     messages = []
@@ -351,26 +466,44 @@ def lister_messages(
     page_token = None
 
     while (
-        len(messages)
+        len(
+            messages
+        )
         < max_messages
     ):
 
         limite = min(
             100,
             max_messages
-            - len(messages)
+            - len(
+                messages
+            ),
         )
+
+        arguments = {
+            "userId":
+                "me",
+
+            "labelIds":
+                [
+                    label_id
+                ],
+
+            "maxResults":
+                limite,
+        }
+
+        if page_token:
+
+            arguments[
+                "pageToken"
+            ] = page_token
 
         resultat = (
             service.users()
             .messages()
             .list(
-                userId="me",
-                labelIds=[
-                    label_id
-                ],
-                maxResults=limite,
-                pageToken=page_token
+                **arguments
             )
             .execute()
         )
@@ -378,7 +511,7 @@ def lister_messages(
         messages.extend(
             resultat.get(
                 "messages",
-                []
+                [],
             )
         )
 
@@ -395,59 +528,115 @@ def lister_messages(
 
 
 # ============================================================
-# EXTRACTION D'UN MAIL
+# ENRICHISSEMENT LINKEDIN
 # ============================================================
 
-def traiter_message(
-    service,
-    message_id,
-    source_attendue
+def enrichir_offres_linkedin(
+    offres
 ):
 
-    message = (
-        service.users()
-        .messages()
-        .get(
-            userId="me",
-            id=message_id,
-            format="full"
-        )
-        .execute()
+    resultat = []
+
+    total = len(
+        offres
     )
 
-    headers = extraire_headers(
-        message
-    )
-
-    sujet = headers.get(
-        "Subject",
-        ""
-    )
-
-    expediteur = headers.get(
-        "From",
-        ""
-    )
-
-    date_email = headers.get(
-        "Date",
-        ""
-    )
-
-    contenu, est_html = (
-        extraire_corps_email(
-            message
-        )
-    )
-
-    if not contenu.strip():
+    for index, offre in enumerate(
+        offres,
+        start=1,
+    ):
 
         print(
-            f"   ⚠️ Corps vide : "
-            f"{sujet}"
+            f"      🌐 LinkedIn "
+            f"{index}/{total} : "
+            f"{offre.get('titre', '')}"
         )
 
-        return []
+        offre = enrichir_offre_linkedin(
+            offre
+        )
+
+        resultat.append(
+            offre
+        )
+
+        donnees = offre.get(
+            "donnees_brutes",
+            {},
+        )
+
+        if not isinstance(
+            donnees,
+            dict
+        ):
+
+            donnees = {}
+
+        if linkedin_description_complete(
+            offre
+        ):
+
+            print(
+                "         ✅ Description complète : "
+                f"{len(offre.get('description', ''))} "
+                "caractères"
+            )
+
+        else:
+
+            print(
+                "         ⚠️ Enrichissement incomplet : "
+                f"{donnees.get('linkedin_enrichissement_erreur', '')}"
+            )
+
+        if index < total:
+
+            time.sleep(
+                1
+            )
+
+    return resultat
+
+
+# ============================================================
+# EXTRACTION SELON LA SOURCE
+# ============================================================
+
+def extraire_offres_source(
+    contenu,
+    est_html,
+    source_attendue,
+):
+
+    # --------------------------------------------------------
+    # LINKEDIN
+    # --------------------------------------------------------
+
+    if source_attendue == "LinkedIn":
+
+        if est_html:
+
+            offres = (
+                extraire_offres_linkedin_html(
+                    contenu
+                )
+            )
+
+        else:
+
+            offres = (
+                extraire_offres_linkedin_texte(
+                    contenu
+                )
+            )
+
+        return enrichir_offres_linkedin(
+            offres
+        )
+
+    # --------------------------------------------------------
+    # APEC / INDEED
+    # --------------------------------------------------------
 
     if est_html:
 
@@ -461,11 +650,7 @@ def traiter_message(
             contenu
         )
 
-    # --------------------------------------------------------
-    # GARDE UNIQUEMENT LA SOURCE DU LIBELLÉ
-    # --------------------------------------------------------
-
-    offres = [
+    return [
         offre
         for offre in offres
         if offre.get(
@@ -474,22 +659,77 @@ def traiter_message(
         == source_attendue
     ]
 
-    # --------------------------------------------------------
-    # AJOUT DES MÉTADONNÉES GMAIL
-    # --------------------------------------------------------
+
+# ============================================================
+# TRAITEMENT D'UN MAIL
+# ============================================================
+
+def traiter_message(
+    service,
+    message_id,
+    source_attendue,
+):
+
+    message = (
+        service.users()
+        .messages()
+        .get(
+            userId="me",
+            id=message_id,
+            format="full",
+        )
+        .execute()
+    )
+
+    headers = extraire_headers(
+        message
+    )
+
+    sujet = headers.get(
+        "Subject",
+        "",
+    )
+
+    expediteur = headers.get(
+        "From",
+        "",
+    )
+
+    date_email = headers.get(
+        "Date",
+        "",
+    )
+
+    contenu, est_html = (
+        extraire_corps_email(
+            message
+        )
+    )
+
+    if not contenu.strip():
+
+        print(
+            "   ⚠️ Corps vide : "
+            f"{sujet}"
+        )
+
+        return []
+
+    offres = extraire_offres_source(
+        contenu,
+        est_html,
+        source_attendue,
+    )
 
     for offre in offres:
 
         source_id = str(
             offre.get(
                 "source_id",
-                ""
+                "",
             )
         )
 
-        # Évite que plusieurs offres dont le titre
-        # n'a pas été extrait aient exactement le
-        # même fingerprint SQLite.
         if (
             not offre.get(
                 "titre"
@@ -509,7 +749,7 @@ def traiter_message(
 
         donnees = offre.get(
             "donnees_brutes",
-            {}
+            {},
         )
 
         if not isinstance(
@@ -519,7 +759,9 @@ def traiter_message(
 
             donnees = {
                 "contenu":
-                    str(donnees)
+                    str(
+                        donnees
+                    )
             }
 
         donnees[
@@ -546,12 +788,40 @@ def traiter_message(
 
 
 # ============================================================
+# VALIDATION D'UN MAIL
+# ============================================================
+
+def verifier_mail_complet(
+    source,
+    offres
+):
+
+    if not offres:
+        return False
+
+    if source != "LinkedIn":
+        return True
+
+    for offre in offres:
+
+        if not linkedin_description_complete(
+            offre
+        ):
+
+            return False
+
+    return True
+
+
+# ============================================================
 # COLLECTE PRINCIPALE
 # ============================================================
 
 def collecter_alertes_gmail(
     max_messages_par_source=100,
-    afficher_progression=True
+    afficher_progression=True,
+    memoriser=True,
+    retraiter_deja_traites=False,
 ):
 
     service = connexion_gmail()
@@ -581,8 +851,9 @@ def collecter_alertes_gmail(
         LABELS_EMPLOI.items()
     ):
 
-        label_id = libelles.get(
-            nom_libelle
+        label_id = trouver_label_id(
+            libelles,
+            nom_libelle,
         )
 
         if not label_id:
@@ -591,7 +862,7 @@ def collecter_alertes_gmail(
 
                 print(
                     f"⚠️ {nom_libelle} : "
-                    f"libellé absent"
+                    "libellé absent"
                 )
 
             continue
@@ -600,32 +871,36 @@ def collecter_alertes_gmail(
             service,
             label_id,
             max_messages=
-                max_messages_par_source
+                max_messages_par_source,
         )
 
-        nouveaux = [
-            message
-            for message in messages
-            if message.get(
-                "id"
-            )
-            not in deja_traites
-        ]
+        if retraiter_deja_traites:
+
+            nouveaux = messages
+
+        else:
+
+            nouveaux = [
+                message
+                for message in messages
+                if message.get(
+                    "id"
+                )
+                not in deja_traites
+            ]
 
         if afficher_progression:
 
             print(
                 f"📨 {source} : "
                 f"{len(messages)} mail(s), "
-                f"{len(nouveaux)} nouveau(x)"
+                f"{len(nouveaux)} à traiter"
             )
 
         for message in nouveaux:
 
-            message_id = (
-                message.get(
-                    "id"
-                )
+            message_id = message.get(
+                "id"
             )
 
             if not message_id:
@@ -636,42 +911,91 @@ def collecter_alertes_gmail(
                 offres = traiter_message(
                     service,
                     message_id,
-                    source
+                    source,
                 )
 
+                # ------------------------------------------------
+                # LINKEDIN :
+                # seules les offres enrichies vont dans le pipeline
+                # ------------------------------------------------
+
+                if source == "LinkedIn":
+
+                    offres_valides = [
+                        offre
+                        for offre in offres
+                        if linkedin_description_complete(
+                            offre
+                        )
+                    ]
+
+                else:
+
+                    offres_valides = offres
+
                 toutes_offres.extend(
-                    offres
+                    offres_valides
                 )
 
                 if afficher_progression:
 
                     print(
-                        f"   → "
-                        f"{len(offres)} offre(s) "
-                        f"extraite(s)"
+                        f"   → {len(offres)} "
+                        "offre(s) détectée(s)"
                     )
 
-                # On mémorise uniquement le mail si
-                # l'analyse du message s'est déroulée
-                # correctement.
-                nouveaux_messages_traites.add(
-                    message_id
+                    if source == "LinkedIn":
+
+                        print(
+                            f"   → {len(offres_valides)} "
+                            "offre(s) enrichie(s) et exploitable(s)"
+                        )
+
+                mail_complet = verifier_mail_complet(
+                    source,
+                    offres,
                 )
+
+                # ------------------------------------------------
+                # MEMOIRE
+                # ------------------------------------------------
+
+                if (
+                    memoriser
+                    and mail_complet
+                ):
+
+                    nouveaux_messages_traites.add(
+                        message_id
+                    )
+
+                elif (
+                    memoriser
+                    and not mail_complet
+                ):
+
+                    if afficher_progression:
+
+                        print(
+                            "   ⚠️ Mail NON mémorisé : "
+                            "il sera retenté au prochain lancement."
+                        )
 
             except Exception as erreur:
 
                 print(
-                    f"   ❌ Mail "
-                    f"{message_id} : "
+                    f"   ❌ Mail {message_id} : "
                     f"{erreur}"
                 )
 
-    sauvegarder_messages_traites(
-        nouveaux_messages_traites
-    )
+    if memoriser:
+
+        sauvegarder_messages_traites(
+            nouveaux_messages_traites
+        )
 
     # ========================================================
-    # DÉDOUBLONNAGE EXACT SOURCE / ID
+    # DEDOUBLONNAGE SOURCE + SOURCE_ID
     # ========================================================
 
     offres_uniques = []
@@ -680,17 +1004,40 @@ def collecter_alertes_gmail(
 
     for offre in toutes_offres:
 
-        cle = (
+        source = str(
             offre.get(
                 "source",
-                ""
-            ),
-
-            offre.get(
-                "source_id",
-                ""
+                "",
             )
         )
+
+        source_id = str(
+            offre.get(
+                "source_id",
+                "",
+            )
+        )
+
+        if source_id:
+
+            cle = (
+                source,
+                source_id,
+            )
+
+        else:
+
+            cle = (
+                source,
+                offre.get(
+                    "url",
+                    "",
+                ),
+                offre.get(
+                    "titre",
+                    "",
+                ),
+            )
 
         if cle in vus:
             continue
@@ -710,43 +1057,97 @@ def collecter_alertes_gmail(
         print(
             f"✅ Gmail : "
             f"{len(offres_uniques)} "
-            f"nouvelle(s) offre(s)"
+            "offre(s) exploitable(s)"
         )
 
     return offres_uniques
 
 
 # ============================================================
-# TEST DIRECT
+# TEST DIRECT NON DESTRUCTIF
 # ============================================================
 
 if __name__ == "__main__":
 
-    offres = collecter_alertes_gmail()
+    offres = collecter_alertes_gmail(
+        max_messages_par_source=20,
+        afficher_progression=True,
+        memoriser=False,
+        retraiter_deja_traites=True,
+    )
 
     print()
 
-    print("=" * 70)
+    print(
+        "=" * 78
+    )
 
     print(
-        f"TOTAL EXTRAIT : "
+        f"TOTAL EXPLOITABLE : "
         f"{len(offres)}"
     )
 
-    print("=" * 70)
+    print(
+        "=" * 78
+    )
 
     for offre in offres:
 
         print()
 
         print(
-            f"[{offre.get('source')}] "
-            f"{offre.get('titre')}"
+            f"SOURCE      : "
+            f"{offre.get('source', '')}"
         )
 
         print(
-            offre.get(
-                "url",
-                ""
-            )
+            f"SOURCE ID   : "
+            f"{offre.get('source_id', '')}"
+        )
+
+        print(
+            f"TITRE       : "
+            f"{offre.get('titre', '')}"
+        )
+
+        print(
+            f"ENTREPRISE  : "
+            f"{offre.get('entreprise', '')}"
+        )
+
+        print(
+            f"LIEU        : "
+            f"{offre.get('lieu', '')}"
+        )
+
+        donnees = offre.get(
+            "donnees_brutes",
+            {},
+        )
+
+        if not isinstance(
+            donnees,
+            dict
+        ):
+
+            donnees = {}
+
+        print(
+            f"ENRICHI     : "
+            f"{donnees.get('linkedin_enrichi', '')}"
+        )
+
+        print(
+            f"DESC.       : "
+            f"{len(offre.get('description', '') or '')} "
+            "caractères"
+        )
+
+        print(
+            f"URL         : "
+            f"{offre.get('url', '')}"
+        )
+
+        print(
+            "-" * 78
         )
